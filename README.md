@@ -58,12 +58,14 @@ Then power off the VM and type `xong` again so the provisioned disk is backed up
 
 ## Tailscale auth key
 
-Set `TS_AUTH_KEY` before starting the VM. The provision script uses it for
-non-interactive `tailscale up`.
+Put your auth key directly in `run.sh` by replacing `PASTE_TS_AUTH_KEY_HERE`:
 
 ```bash
-TS_AUTH_KEY=tskey-auth-xxxxx bash run.sh
+bash run.sh
 ```
+
+You can still override it from the command line with
+`TS_AUTH_KEY=tskey-auth-xxxxx bash run.sh`.
 
 Optional Tailscale settings:
 
@@ -80,8 +82,7 @@ and no `bore.pub` tunnel.
 By default the script uses a temporary Cloudflare Quick Tunnel. For a named
 Cloudflare Tunnel, set `CF_TUNNEL_TOKEN` and configure the tunnel service in
 Cloudflare Zero Trust to point to `http://127.0.0.1:6080`. Set
-`CF_PUBLIC_HOSTNAME` if you want the script and Telegram message to print your
-stable hostname.
+`CF_PUBLIC_HOSTNAME` if you want the script to print your stable hostname.
 
 ```bash
 CF_TUNNEL_TOKEN=xxxxx CF_PUBLIC_HOSTNAME=https://vm.example.com bash run.sh

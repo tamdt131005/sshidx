@@ -7,8 +7,6 @@
     novnc
     python3Packages.websockify
     util-linux
-    jq
-    curl
     python3
   ];
 

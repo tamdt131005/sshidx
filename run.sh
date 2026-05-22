@@ -11,7 +11,6 @@ ISO_SHA256="${ISO_SHA256:-f802033362595ad55de7bce00c500c51a756c94e229768afdcf7e6
 REMOTE_DIR="${REMOTE_DIR:-gdrive:IDX_VM_linux_server}"
 REMOTE_NAME="${REMOTE_NAME:-linux_server.qcow2}"
 REMOTE_PATH="${REMOTE_PATH:-$REMOTE_DIR/$REMOTE_NAME}"
-TG_TOKEN="${TG_TOKEN:-}"
 FLAG_FILE="${FLAG_FILE:-$HOME/linux_server.installed.flag}"
 RAM="${RAM:-2G}"
 CORES="${CORES:-2}"
@@ -25,7 +24,7 @@ NOVNC_PORT="${NOVNC_PORT:-6080}"
 CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-}"
 CF_PUBLIC_HOSTNAME="${CF_PUBLIC_HOSTNAME:-}"
 CLOUDFLARED_URL="${CLOUDFLARED_URL:-http://127.0.0.1:${NOVNC_PORT}}"
-TS_AUTH_KEY="${TS_AUTH_KEY:-}"
+TS_AUTH_KEY="${TS_AUTH_KEY:-PASTE_TS_AUTH_KEY_HERE}"
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-idx-linux-server}"
 TAILSCALE_UP_FLAGS="${TAILSCALE_UP_FLAGS:---ssh}"
 PROVISION_DIR="${PROVISION_DIR:-/tmp/linux-server-provision}"
@@ -224,28 +223,6 @@ novnc_public_url() {
     printf '%s/vnc.html?autoconnect=1&resize=scale\n' "$base"
 }
 
-send_telegram() {
-    local novnc_url="$1"
-    local mode="$2"
-    local chat_id
-    local msg
-
-    [ -n "$TG_TOKEN" ] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
-
-    chat_id="$(curl -s "https://api.telegram.org/bot${TG_TOKEN}/getUpdates" \
-        | jq -r '.result[-1].message.chat.id // .result[-1].callback_query.message.chat.id // empty')"
-
-    [ -n "$chat_id" ] || return 0
-
-    msg="$(printf 'Linux server VM ready\nnoVNC: %s\nMode: %s\nType xong to stop and backup.' \
-        "${novnc_url:-check /tmp/cloudflared-novnc.log}" "$mode")"
-
-    curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        --data-urlencode "text=${msg}" >/dev/null || true
-}
-
 backup_disk() {
     if ! rclone_remote_ready; then
         log "Rclone remote is not ready. Skipping cloud backup."
@@ -339,7 +316,7 @@ start_service sshd
 start_service tailscale
 sleep 2
 
-if [ -n "\$TS_AUTH_KEY" ]; then
+if [ -n "\$TS_AUTH_KEY" ] && [ "\$TS_AUTH_KEY" != "PASTE_TS_AUTH_KEY_HERE" ]; then
     log "Logging in to Tailscale with TS_AUTH_KEY..."
     set -- --auth-key "\$TS_AUTH_KEY"
 
@@ -350,7 +327,7 @@ if [ -n "\$TS_AUTH_KEY" ]; then
     # TAILSCALE_UP_FLAGS is intentionally split so callers can pass multiple flags.
     tailscale up "\$@" \$TAILSCALE_UP_FLAGS
 else
-    log "TS_AUTH_KEY is empty; installed Tailscale but skipped login."
+    log "TS_AUTH_KEY is empty or still set to placeholder; installed Tailscale but skipped login."
 fi
 
 tailscale status || true
@@ -422,7 +399,6 @@ qemu-system-x86_64 \
     -vnc "127.0.0.1:${QEMU_VNC_DISPLAY}" -usb -device usb-tablet &
 
 QEMU_PID=$!
-send_telegram "$NOVNC_URL" "$MODE"
 
 while true; do
     read -rp "Type 'xong' to stop VM and backup: " input
