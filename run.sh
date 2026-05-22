@@ -220,7 +220,25 @@ novnc_public_url() {
 
     [ -n "$base" ] || return 0
     base="${base%/}"
-    printf '%s/vnc.html?autoconnect=1&resize=scale\n' "$base"
+    printf '%s/vnc.html?autoconnect=true&resize=scale&reconnect=true&path=websockify\n' "$base"
+}
+
+wait_for_tcp() {
+    local host="$1"
+    local port="$2"
+    local timeout_seconds="$3"
+    local elapsed=0
+
+    while [ "$elapsed" -lt "$timeout_seconds" ]; do
+        if (echo >"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
+            return 0
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
 }
 
 backup_disk() {
@@ -356,11 +374,6 @@ build_qemu_accel_args
 write_provision_script
 start_provision_http_server
 
-rm -f /tmp/novnc.log /tmp/cloudflared-novnc.log
-start_novnc || exit 1
-start_cloudflared || exit 1
-NOVNC_URL="$(novnc_public_url "$CLOUDFLARE_ADDR")"
-
 if [ ! -f "$FLAG_FILE" ]; then
     BOOT_ARGS=(-cdrom "$ISO_FILE" -boot order=d)
     MODE="INSTALL (Alpine ISO)"
@@ -369,13 +382,11 @@ else
     MODE="RUNNING (installed disk)"
 fi
 
+rm -f /tmp/qemu.log /tmp/novnc.log /tmp/cloudflared-novnc.log
+
 log "------------------------------------------------"
 log "Linux server VM is starting"
 log "Mode: $MODE"
-log "noVNC via Cloudflare: ${NOVNC_URL:-not ready; check /tmp/cloudflared-novnc.log}"
-log "noVNC local: http://${NOVNC_LISTEN_HOST}:${NOVNC_PORT}/vnc.html"
-log "QEMU console backend is local only: 127.0.0.1:${QEMU_VNC_PORT}"
-log "Guest host forwards stay local: ${HOST_SSH_PORT}->22, ${HOST_HTTP_PORT}->80, ${HOST_HTTPS_PORT}->443"
 if [ ! -f "$FLAG_FILE" ]; then
     log "First install: run setup-alpine, install to vda, power off, type xong, then rerun."
 else
@@ -385,7 +396,6 @@ else
     fi
 fi
 log "Install hint: login root, run setup-alpine, install to disk vda, enable openssh."
-log "Type 'xong' then Enter to stop and backup."
 log "------------------------------------------------"
 
 qemu-system-x86_64 \
@@ -396,9 +406,46 @@ qemu-system-x86_64 \
     -netdev "user,id=net0,hostfwd=tcp::${HOST_SSH_PORT}-:22,hostfwd=tcp::${HOST_HTTP_PORT}-:80,hostfwd=tcp::${HOST_HTTPS_PORT}-:443" \
     -device virtio-net-pci,netdev=net0 \
     -device virtio-rng-pci \
-    -vnc "127.0.0.1:${QEMU_VNC_DISPLAY}" -usb -device usb-tablet &
+    -vnc "127.0.0.1:${QEMU_VNC_DISPLAY}" -usb -device usb-tablet \
+    >/tmp/qemu.log 2>&1 &
 
 QEMU_PID=$!
+
+if ! wait_for_tcp 127.0.0.1 "$QEMU_VNC_PORT" 45; then
+    log "QEMU console did not open on 127.0.0.1:${QEMU_VNC_PORT}."
+    log "Last QEMU log lines:"
+    tail -n 80 /tmp/qemu.log 2>/dev/null || true
+    kill "$QEMU_PID" 2>/dev/null || true
+    exit 1
+fi
+
+start_novnc || {
+    kill "$QEMU_PID" 2>/dev/null || true
+    exit 1
+}
+
+if ! wait_for_tcp "$NOVNC_LISTEN_HOST" "$NOVNC_PORT" 20; then
+    log "noVNC/websockify did not open on ${NOVNC_LISTEN_HOST}:${NOVNC_PORT}."
+    log "Last noVNC log lines:"
+    tail -n 80 /tmp/novnc.log 2>/dev/null || true
+    kill "$QEMU_PID" 2>/dev/null || true
+    exit 1
+fi
+
+start_cloudflared || {
+    kill "$NOVNC_PID" 2>/dev/null || true
+    kill "$QEMU_PID" 2>/dev/null || true
+    exit 1
+}
+NOVNC_URL="$(novnc_public_url "$CLOUDFLARE_ADDR")"
+
+log "------------------------------------------------"
+log "noVNC via Cloudflare: ${NOVNC_URL:-not ready; check /tmp/cloudflared-novnc.log}"
+log "noVNC local: http://${NOVNC_LISTEN_HOST}:${NOVNC_PORT}/vnc.html"
+log "QEMU console backend is local only: 127.0.0.1:${QEMU_VNC_PORT}"
+log "Guest host forwards stay local: ${HOST_SSH_PORT}->22, ${HOST_HTTP_PORT}->80, ${HOST_HTTPS_PORT}->443"
+log "Type 'xong' then Enter to stop and backup."
+log "------------------------------------------------"
 
 while true; do
     read -rp "Type 'xong' to stop VM and backup: " input

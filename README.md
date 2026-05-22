@@ -79,6 +79,11 @@ On later runs, use the printed noVNC Cloudflare URL for the VM console. The
 QEMU console backend only listens on `127.0.0.1`, so there is no public VNC port
 and no `bore.pub` tunnel.
 
+If noVNC shows a server connection failure, restart `run.sh` and use the newest
+printed URL. The script waits for QEMU and noVNC to be ready before starting the
+Cloudflare tunnel; useful logs are in `/tmp/qemu.log`, `/tmp/novnc.log`, and
+`/tmp/cloudflared-novnc.log`.
+
 By default the script uses a temporary Cloudflare Quick Tunnel. For a named
 Cloudflare Tunnel, set `CF_TUNNEL_TOKEN` and configure the tunnel service in
 Cloudflare Zero Trust to point to `http://127.0.0.1:6080`. Set
