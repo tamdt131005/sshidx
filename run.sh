@@ -34,7 +34,7 @@ GUEST_ROOT_PASS="${GUEST_ROOT_PASS:-root}"
 AUTO_PROVISION="${AUTO_PROVISION:-1}"
 SERIAL_PORT="${SERIAL_PORT:-4321}"
 PROVISIONED_FLAG="${PROVISIONED_FLAG:-$HOME/linux_server.provisioned.flag}"
-BOOT_WAIT="${BOOT_WAIT:-45}"
+BOOT_WAIT="${BOOT_WAIT:-90}"
 
 log() {
     printf '%s\n' "$*"
@@ -188,7 +188,9 @@ start_novnc() {
 
 read_cloudflared_addr() {
     local log_file="$1"
-    grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$log_file" 2>/dev/null | tail -n 1 || true
+    grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' "$log_file" 2>/dev/null \
+        | grep -v 'api\.trycloudflare\.com' \
+        | tail -n 1 || true
 }
 
 start_cloudflared() {
@@ -335,6 +337,19 @@ if command -v ssh-keygen >/dev/null 2>&1; then
 fi
 
 modprobe tun >/dev/null 2>&1 || true
+
+# --- Bật serial console getty trên ttyS0 (cần cho auto-provision) ---
+if ! grep -q 'ttyS0' /etc/inittab 2>/dev/null; then
+    log "Enabling serial console getty on ttyS0..."
+    echo 'ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100' >> /etc/inittab
+    kill -HUP 1 2>/dev/null || true
+fi
+
+# --- Cho phép root SSH login (cần cho quản lý từ xa) ---
+if [ -f /etc/ssh/sshd_config ]; then
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+fi
+
 start_service sshd
 start_service tailscale
 sleep 2
@@ -355,6 +370,23 @@ fi
 
 tailscale status || true
 log "Provision complete."
+
+# --- Tạo script tự động re-authenticate Tailscale mỗi lần boot ---
+log "Creating Tailscale auto-reauth boot script..."
+mkdir -p /etc/local.d
+
+{
+echo '#!/bin/sh'
+echo 'sleep 15'
+echo 'if ! command -v tailscale >/dev/null 2>&1; then exit 0; fi'
+echo 'if tailscale status 2>/dev/null | grep -q "^100\\."; then exit 0; fi'
+echo "tailscale up --auth-key \$TS_AUTH_KEY --hostname \$TAILSCALE_HOSTNAME \$TAILSCALE_UP_FLAGS 2>/dev/null || true"
+echo 'tailscale status || true'
+} > /etc/local.d/tailscale-reauth.start
+
+chmod +x /etc/local.d/tailscale-reauth.start
+rc-update add local default 2>/dev/null || true
+log "Tailscale auto-reauth boot script installed."
 EOF
 
     chmod 700 "$PROVISION_DIR/provision.sh"
@@ -533,9 +565,11 @@ log "------------------------------------------------"
 log "Linux server VM is starting"
 log "Mode: $MODE"
 if [ ! -f "$FLAG_FILE" ]; then
-    log "First install: run setup-alpine, install to vda, power off, type xong, then rerun."
+    log "First install: run setup-alpine via noVNC, complete the install, type 'poweroff', then type 'xong' here to save."
     log "IMPORTANT: set root password to '${GUEST_ROOT_PASS}' during setup-alpine for auto-provision."
-    log "Tailscale will not appear online until provision.sh is run after install."
+    log "NOTE: Auto-provision might fail if serial console is not enabled on the installed disk."
+    log "      If Tailscale doesn't connect on next boot, run provision.sh manually from noVNC:"
+    log "      mount /dev/vdb /mnt && sh /mnt/provision.sh"
 else
     if [ -f "$PROVISIONED_FLAG" ]; then
         log "Tailscale: already provisioned, auto-starts on boot."
@@ -549,13 +583,13 @@ else
         log "Provision HTTP fallback: wget -O - http://10.0.2.2:${PROVISION_PORT}/provision.sh | sh"
     fi
 fi
-log "Install hint: login root, run setup-alpine, set password '${GUEST_ROOT_PASS}', install to disk vda, enable openssh."
+log "Install hint: login root, run 'setup-alpine', set password to '${GUEST_ROOT_PASS}', install to disk 'vda', enable 'openssh'."
 log "------------------------------------------------"
 
 qemu-system-x86_64 \
     "${QEMU_ACCEL_ARGS[@]}" -smp "$CORES" -m "$RAM" -machine q35 \
     -drive "file=$DISK_FILE,if=virtio,format=qcow2,cache=writeback,discard=unmap" \
-    -drive "file=fat:ro:$PROVISION_DIR,format=raw,if=virtio,readonly=on" \
+    -drive "file=fat:ro:$PROVISION_DIR,if=virtio,readonly=on" \
     "${BOOT_ARGS[@]}" \
     -netdev "user,id=net0,hostfwd=tcp::${HOST_SSH_PORT}-:22,hostfwd=tcp::${HOST_HTTP_PORT}-:80,hostfwd=tcp::${HOST_HTTPS_PORT}-:443" \
     -device virtio-net-pci,netdev=net0 \
