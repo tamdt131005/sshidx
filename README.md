@@ -43,6 +43,8 @@ After the install finishes, power off the VM from Alpine, then type `xong` in
 the script terminal so the disk is marked installed and backed up. Start
 `run.sh` again to boot from the installed disk.
 
+Tailscale will not appear online during this first live-ISO install step.
+
 To install OpenSSH and Tailscale in the installed guest, run this as root inside
 Alpine after the second boot:
 

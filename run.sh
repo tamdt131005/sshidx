@@ -30,6 +30,11 @@ TAILSCALE_UP_FLAGS="${TAILSCALE_UP_FLAGS:---ssh}"
 PROVISION_DIR="${PROVISION_DIR:-/tmp/linux-server-provision}"
 PROVISION_PORT="${PROVISION_PORT:-18080}"
 ENABLE_PROVISION_HTTP="${ENABLE_PROVISION_HTTP:-0}"
+GUEST_ROOT_PASS="${GUEST_ROOT_PASS:-root}"
+AUTO_PROVISION="${AUTO_PROVISION:-1}"
+SERIAL_PORT="${SERIAL_PORT:-4321}"
+PROVISIONED_FLAG="${PROVISIONED_FLAG:-$HOME/linux_server.provisioned.flag}"
+BOOT_WAIT="${BOOT_WAIT:-45}"
 
 log() {
     printf '%s\n' "$*"
@@ -368,6 +373,146 @@ start_provision_http_server() {
     PROVISION_HTTP_PID="$!"
 }
 
+_auto_provision_worker() {
+    # Worker chạy nền, tương tác serial console qua raw TCP.
+    # Dùng bash /dev/tcp/ + cat reader nền + grep pattern matching.
+
+    local serial_out="/tmp/serial-provision.out"
+    local reader_pid=""
+
+    log "[auto-provision] Chờ ${BOOT_WAIT}s cho VM boot..."
+    sleep "$BOOT_WAIT"
+
+    # Retry kết nối serial (VM có thể chưa sẵn sàng)
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if (echo >/dev/tcp/127.0.0.1/${SERIAL_PORT}) 2>/dev/null; then
+            break
+        fi
+        if [ "$attempt" -eq 5 ]; then
+            log "[auto-provision] Serial không sẵn sàng sau 5 lần thử. Bỏ qua."
+            return 1
+        fi
+        log "[auto-provision] Serial chưa sẵn sàng, thử lại ($attempt/5)..."
+        sleep 5
+    done
+
+    # Mở kết nối TCP (fd 3 = đọc + ghi)
+    exec 3<>/dev/tcp/127.0.0.1/${SERIAL_PORT} || {
+        log "[auto-provision] Không thể mở kết nối serial."
+        return 1
+    }
+
+    # Reader nền: ghi mọi output serial vào file để grep kiểm tra
+    > "$serial_out"
+    cat <&3 >> "$serial_out" 2>/dev/null &
+    reader_pid=$!
+
+    # Cleanup khi worker thoát
+    trap 'kill $reader_pid 2>/dev/null; exec 3>&- 2>/dev/null' EXIT
+
+    # --- Helper ---
+    _send() {
+        printf '%s\r\n' "$1" >&3
+        sleep "${2:-1}"
+    }
+
+    _wait_for() {
+        local pattern="$1" timeout="${2:-120}" i=0
+        while [ "$i" -lt "$timeout" ]; do
+            if grep -q "$pattern" "$serial_out" 2>/dev/null; then
+                return 0
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+        return 1
+    }
+
+    _recent_has() {
+        # Kiểm tra 500 byte cuối (tránh match boot messages cũ)
+        tail -c 500 "$serial_out" 2>/dev/null | grep -qi "$1"
+    }
+
+    # --- Bắt đầu tương tác serial ---
+    log "[auto-provision] Đã kết nối serial console."
+
+    # Gửi Enter để kích hoạt login prompt
+    _send "" 2
+    _send "" 2
+
+    # Chờ login prompt
+    log "[auto-provision] Chờ login prompt..."
+    if ! _wait_for "login:" 120; then
+        log "[auto-provision] Timeout chờ login. VM có thể chưa bật serial."
+        return 1
+    fi
+
+    # Đăng nhập root
+    log "[auto-provision] Đăng nhập root..."
+    _send "root" 3
+
+    # Kiểm tra password prompt (500 byte cuối)
+    if _recent_has "password"; then
+        log "[auto-provision] Gửi mật khẩu..."
+        _send "$GUEST_ROOT_PASS" 3
+    fi
+
+    # Xác nhận shell sẵn sàng bằng echo marker
+    _send 'echo __SHELL_READY__' 2
+    if ! _wait_for "__SHELL_READY__" 15; then
+        log "[auto-provision] Shell chưa sẵn sàng. Bỏ qua."
+        return 1
+    fi
+
+    # --- Chạy provision ---
+    log "[auto-provision] Mount provision drive..."
+    _send 'mkdir -p /mnt/provision' 2
+    _send 'for dev in /dev/vdb /dev/vdb1 /dev/sdb /dev/sdb1; do mount "$dev" /mnt/provision 2>/dev/null && break; done' 4
+
+    log "[auto-provision] Chạy provision.sh..."
+    _send 'if [ -f /mnt/provision/provision.sh ]; then sh /mnt/provision/provision.sh && echo AUTO_PROVISION_OK || echo AUTO_PROVISION_FAIL; else echo AUTO_PROVISION_NO_SCRIPT; fi' 5
+
+    # Chờ provision hoàn tất (apk install có thể mất vài phút)
+    log "[auto-provision] Chờ provision hoàn tất (tối đa 10 phút)..."
+    if _wait_for "AUTO_PROVISION_OK" 600; then
+        log "[auto-provision] === THÀNH CÔNG! Tailscale đã online. ==="
+        touch "$PROVISIONED_FLAG"
+        return 0
+    fi
+
+    # Kiểm tra lỗi cụ thể
+    if grep -q "AUTO_PROVISION_FAIL" "$serial_out" 2>/dev/null; then
+        log "[auto-provision] Provision thất bại. Kiểm tra qua noVNC."
+    elif grep -q "AUTO_PROVISION_NO_SCRIPT" "$serial_out" 2>/dev/null; then
+        log "[auto-provision] Không tìm thấy provision.sh trên ổ provision."
+    else
+        log "[auto-provision] Timeout. Kiểm tra qua noVNC hoặc /tmp/serial-provision.out"
+    fi
+    return 1
+}
+
+auto_provision() {
+    AUTO_PROVISION_PID=""
+
+    [ "$AUTO_PROVISION" = "1" ] || return 0
+    [ -f "$FLAG_FILE" ] || return 0
+
+    if [ -f "$PROVISIONED_FLAG" ]; then
+        log "Already provisioned. Tailscale auto-starts on boot."
+        return 0
+    fi
+
+    if [ -z "$GUEST_ROOT_PASS" ]; then
+        log "GUEST_ROOT_PASS is empty. Skipping auto-provision."
+        return 0
+    fi
+
+    log "Auto-provision will start in ${BOOT_WAIT}s (background, log: /tmp/auto-provision.log)..."
+    _auto_provision_worker >/tmp/auto-provision.log 2>&1 &
+    AUTO_PROVISION_PID="$!"
+}
+
 cleanup_old_processes
 prepare_disk
 build_qemu_accel_args
@@ -382,34 +527,45 @@ else
     MODE="RUNNING (installed disk)"
 fi
 
-rm -f /tmp/qemu.log /tmp/novnc.log /tmp/cloudflared-novnc.log
+rm -f /tmp/qemu.log /tmp/novnc.log /tmp/cloudflared-novnc.log /tmp/auto-provision.log
 
 log "------------------------------------------------"
 log "Linux server VM is starting"
 log "Mode: $MODE"
 if [ ! -f "$FLAG_FILE" ]; then
     log "First install: run setup-alpine, install to vda, power off, type xong, then rerun."
+    log "IMPORTANT: set root password to '${GUEST_ROOT_PASS}' during setup-alpine for auto-provision."
+    log "Tailscale will not appear online until provision.sh is run after install."
 else
-    log "Provision: mount /dev/vdb or /dev/vdb1 at /mnt/provision, then run /mnt/provision/provision.sh."
+    if [ -f "$PROVISIONED_FLAG" ]; then
+        log "Tailscale: already provisioned, auto-starts on boot."
+    elif [ "$AUTO_PROVISION" = "1" ] && [ -n "$GUEST_ROOT_PASS" ]; then
+        log "Auto-provision: will run provision.sh automatically after boot (${BOOT_WAIT}s delay)."
+        log "Serial console: nc 127.0.0.1 ${SERIAL_PORT}"
+    else
+        log "Manual provision: mount /dev/vdb at /mnt/provision, then run /mnt/provision/provision.sh."
+    fi
     if [ "$ENABLE_PROVISION_HTTP" = "1" ]; then
         log "Provision HTTP fallback: wget -O - http://10.0.2.2:${PROVISION_PORT}/provision.sh | sh"
     fi
 fi
-log "Install hint: login root, run setup-alpine, install to disk vda, enable openssh."
+log "Install hint: login root, run setup-alpine, set password '${GUEST_ROOT_PASS}', install to disk vda, enable openssh."
 log "------------------------------------------------"
 
 qemu-system-x86_64 \
     "${QEMU_ACCEL_ARGS[@]}" -smp "$CORES" -m "$RAM" -machine q35 \
     -drive "file=$DISK_FILE,if=virtio,format=qcow2,cache=writeback,discard=unmap" \
-    -drive "file=fat:ro:$PROVISION_DIR,format=raw,if=virtio" \
+    -drive "file=fat:ro:$PROVISION_DIR,format=raw,if=virtio,readonly=on" \
     "${BOOT_ARGS[@]}" \
     -netdev "user,id=net0,hostfwd=tcp::${HOST_SSH_PORT}-:22,hostfwd=tcp::${HOST_HTTP_PORT}-:80,hostfwd=tcp::${HOST_HTTPS_PORT}-:443" \
     -device virtio-net-pci,netdev=net0 \
     -device virtio-rng-pci \
     -vnc "127.0.0.1:${QEMU_VNC_DISPLAY}" -usb -device usb-tablet \
+    -serial tcp:127.0.0.1:${SERIAL_PORT},server=on,wait=off \
     >/tmp/qemu.log 2>&1 &
 
 QEMU_PID=$!
+auto_provision
 
 if ! wait_for_tcp 127.0.0.1 "$QEMU_VNC_PORT" 45; then
     log "QEMU console did not open on 127.0.0.1:${QEMU_VNC_PORT}."
@@ -443,6 +599,7 @@ log "------------------------------------------------"
 log "noVNC via Cloudflare: ${NOVNC_URL:-not ready; check /tmp/cloudflared-novnc.log}"
 log "noVNC local: http://${NOVNC_LISTEN_HOST}:${NOVNC_PORT}/vnc.html"
 log "QEMU console backend is local only: 127.0.0.1:${QEMU_VNC_PORT}"
+log "Serial console: nc 127.0.0.1 ${SERIAL_PORT}"
 log "Guest host forwards stay local: ${HOST_SSH_PORT}->22, ${HOST_HTTP_PORT}->80, ${HOST_HTTPS_PORT}->443"
 log "Type 'xong' then Enter to stop and backup."
 log "------------------------------------------------"
@@ -472,5 +629,8 @@ if [ -n "${NOVNC_PID:-}" ]; then
 fi
 if [ -n "${PROVISION_HTTP_PID:-}" ]; then
     kill "$PROVISION_HTTP_PID" 2>/dev/null || true
+fi
+if [ -n "${AUTO_PROVISION_PID:-}" ]; then
+    kill "$AUTO_PROVISION_PID" 2>/dev/null || true
 fi
 log "Done."
